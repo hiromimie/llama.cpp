@@ -11,6 +11,7 @@
 
 #include "arch-fallback.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <cassert>
@@ -4861,35 +4862,48 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     matrix_row_counts[i02] += 1;
                 }
             }
+
+            // Every thread starts at ith, so the first unprocessed chunk is nth.
+            ggml_threadpool_chunk_set(params->threadpool, nth);
         }
 
         ggml_barrier(params->threadpool);
 
-        // compute each matrix multiplication in sequence
-        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-            const int64_t cne1 = matrix_row_counts[cur_a];
+        // distribute (expert, row block) chunks dynamically so that slower cores do not stall the others
+        int64_t n_active = 0;
+        for (int a = 0; a < n_as; ++a) {
+            n_active += matrix_row_counts[a] > 0;
+        }
 
-            if (cne1 == 0) {
-                continue;
+        // ~4 chunks per thread, each chunk a multiple of NB_COLS rows
+        const int64_t n_blocks          = (ne01 + NB_COLS - 1) / NB_COLS;
+        const int64_t nchunk_per_expert = std::clamp<int64_t>((nth * 4 + n_active - 1) / std::max<int64_t>(n_active, 1), 1, n_blocks);
+        const int64_t blocks_per_chunk  = (n_blocks + nchunk_per_expert - 1) / nchunk_per_expert;
+        const int64_t nchunk_expert     = (n_blocks + blocks_per_chunk - 1) / blocks_per_chunk;
+        const int64_t nchunk            = n_active * nchunk_expert;
+
+        // chunks are fetched in increasing order, so the active expert can be found with a forward-only cursor
+        int     cur_a    = -1;
+        int64_t i_active = -1;
+
+        for (int64_t current_chunk = ith; current_chunk < nchunk; current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1)) {
+            while (i_active < current_chunk / nchunk_expert) {
+                do {
+                    ++cur_a;
+                } while (matrix_row_counts[cur_a] == 0);
+                ++i_active;
             }
 
             const auto * src0_cur = (const char *) src0->data + cur_a*nb02;
 
-            //const int64_t nr0 = ne01; // src0 rows
-            const int64_t nr1 = cne1; // src1 rows
+            const int64_t nr1 = matrix_row_counts[cur_a]; // src1 rows
 
-            int64_t src0_cur_start = (ith * ne01) / nth;
-            int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
-
-            // Align boundaries to NB_COLS - round up to ensure all data is included
-            src0_cur_start = (src0_cur_start % NB_COLS) ? src0_cur_start + NB_COLS - (src0_cur_start % NB_COLS) : src0_cur_start;
-            src0_cur_end   = (src0_cur_end   % NB_COLS) ? src0_cur_end   + NB_COLS - (src0_cur_end   % NB_COLS) : src0_cur_end;
-            if (src0_cur_end > ne01) {
-                src0_cur_end = ne01;
-            }
+            const int64_t ib             = current_chunk % nchunk_expert;
+            const int64_t src0_cur_start = ib * blocks_per_chunk * NB_COLS;
+            const int64_t src0_cur_end   = std::min<int64_t>(src0_cur_start + blocks_per_chunk * NB_COLS, ne01);
 
             if (src0_cur_start >= src0_cur_end) {
-                return;
+                continue;
             }
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {

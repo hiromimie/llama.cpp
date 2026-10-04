@@ -76,14 +76,27 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
 
     for (const auto & [buft, mb] : memory_breakdown) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+
         if (ggml_backend_buft_is_host(buft)) {
             ret.back().mb.model   += mb.model;
             ret.back().mb.context += mb.context;
             ret.back().mb.compute += mb.compute;
+
+            // host buffers of an integrated GPU (e.g. pinned memory) are taken from the same budget as its device memory
+            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                for (size_t i = 0; i < nd; i++) {
+                    if (dev == llama_model_get_device(model, i)) {
+                        ret[i].mb.model   += mb.model;
+                        ret[i].mb.context += mb.context;
+                        ret[i].mb.compute += mb.compute;
+                        break;
+                    }
+                }
+            }
             continue;
         }
 
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
         if (!dev) {
             continue;
         }
