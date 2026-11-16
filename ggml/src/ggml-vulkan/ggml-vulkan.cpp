@@ -3217,7 +3217,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     // RDNA3/4: above four columns, static 4 rows for all types bench faster than the default
     const bool is_rdna3_or_4 = device->vendor_id == VK_VENDOR_ID_AMD && (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
-    auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3_or_4 && i >= 4) ? 4u : rows; };
+    // AMD proprietary driver on RDNA3: 4 rows are much slower at 5-7 columns, keep them only at 8 (upstream PR #29679)
+    const bool rdna3_amd_proprietary = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 &&
+                                       device->driver_id == vk::DriverId::eAmdProprietary;
+    auto const &rm_int_n = [&](uint32_t rows, uint32_t i) {
+        return (is_rdna3_or_4 && i >= 4 && !(rdna3_amd_proprietary && i < 7)) ? 4u : rows;
+    };
     // RDNA3/4 and NVIDIA except pre-Turing: use 4 rows for MUL_MAT_ID MMVQ.
     auto const &rm_id = [&](uint32_t rows) {
         if (device->vendor_id == VK_VENDOR_ID_NVIDIA &&
